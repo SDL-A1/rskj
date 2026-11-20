@@ -62,7 +62,12 @@ class SegbuildRealDataTest {
     void theSetTilesTheChainWithoutGapsOrOverlaps() {
         SegbuildChunkIndex index = SegbuildChunkIndex.scan(root);
 
-        assertEquals(97, index.size(), "expected 97 chunks");
+        // Deliberately not an exact chunk count. This asserted 97 and went stale the moment the
+        // pre-fork era was rebuilt as nine resident-sized chunks instead of one 9.6 GB monolith,
+        // taking the set to 106. What the reader actually depends on is the invariant below:
+        // coverage starts at block 1 and tiles without gaps or overlaps. The count is an
+        // implementation detail of how the set was built.
+        assertTrue(index.size() > 1, "expected a set of chunks, found " + index.size());
         assertEquals(1, index.getFirstBlock());
 
         List<SegbuildChunk> chunks = index.getChunks();

@@ -266,7 +266,22 @@ test {
         logger.lifecycle("Running test: ${descriptor}")
     }
 
-    jvmArgs '-Xss32m', '-Xmx4G'
+    // Overridable: a resident segbuild chunk is sized by the chunk, and the
+    // largest in the set needs more than 4G once the loader's own buffers are
+    // counted. A test JVM that dies mid-run reports as "could not write XML
+    // test results", which looks like a disk problem rather than a heap one.
+    jvmArgs '-Xss32m', "-Xmx${project.findProperty('testMaxHeap') ?: '4G'}"
+
+    // Forward the properties the real-data and benchmark tests document. Without this a
+    // -Dsegbuild.dir on the command line reaches Gradle's JVM and not the test's, so those
+    // tests silently keep using their defaults -- which is how a test aimed at one chunk
+    // quietly measures another.
+    ['segbuild.dir', 'segbuild.chunk', 'segbuild.resident',
+     'bench.from', 'bench.to', 'bench.backend', 'bench.extra'].each { key ->
+        if (System.getProperty(key) != null) {
+            systemProperty(key, System.getProperty(key))
+        }
+    }
 
     testLogging {
         events "failed"
