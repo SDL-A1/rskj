@@ -46,6 +46,29 @@ import java.util.Map;
 /**
  * Implementation of a bitcoinj blockstore that persists to RSK's Repository
  *
+ * The cache is DEMAND-POPULATED and holds NO NEGATIVE ENTRIES.
+ *
+ *  - Nothing is read speculatively. Entries come from reads the node performed
+ *    because something asked for them, and from put(), which involves no read.
+ *    This keeps a block's repository read set equal to what consensus required,
+ *    which state proofs and snapshot-style sync depend on.
+ *
+ *  - get() populates the cache but never answers from it. One Factory's cache
+ *    is shared by every store it makes, and those stores have separate
+ *    repository tracks, so answering from the cache would let one track report
+ *    a block present that only another track holds. getFromCache() is the
+ *    cache accessor; getStoredBlockAtMainChainDepth consults it first and falls
+ *    back to get(), so nothing on the consensus path loses a cache hit.
+ *
+ *  - An absent block is never recorded. A repository read that cannot find a
+ *    node and a genuinely absent value are the same null, so caching an absence
+ *    would let a partial state produce a wrong answer for a later
+ *    consensus-required lookup. The cache may answer or say nothing; it must
+ *    never say "no".
+ *
+ * Only hash -> StoredBlock is cached. The chain head and the RSKIP199
+ * height->hash index are mutable and are deliberately left uncached.
+ *
  * @author Oscar Guindzberg
  */
 public class RepositoryBtcBlockStoreWithCache implements BtcBlockStoreWithCache {
@@ -115,6 +138,10 @@ public class RepositoryBtcBlockStoreWithCache implements BtcBlockStoreWithCache 
         repository.addStorageBytes(contractAddress, DataWord.valueFromHex(hash.toString()), ba);
         if (cacheBlocks != null) {
             StoredBlock chainHead = getChainHead();
+            // Caching a block we are writing costs no read. The depth gate is a
+            // slot-budget heuristic only; since populateCache was removed it no
+            // longer bounds any speculative walk. Blocks below this depth still
+            // reach the cache when a lookup actually reads them (see get()).
             if (chainHead == null || chainHead.getHeight() - storedBlock.getHeight() < this.maxDepthBlockCache) {
                 cacheBlocks.put(storedBlock.getHeader().getHash(), storedBlock);
             }
@@ -123,13 +150,37 @@ public class RepositoryBtcBlockStoreWithCache implements BtcBlockStoreWithCache 
 
     @Override
     public synchronized StoredBlock get(Sha256Hash hash) {
+        // Deliberately does NOT answer from the cache. get() reports what this
+        // instance's repository holds, and callers rely on that: the cache is
+        // shared by every store a Factory makes, while each store has its own
+        // repository track, so serving from it here would let one track report a
+        // block that only exists in another -- a presence leak across forks.
+        // getFromCache() is the cache accessor, and
+        // getStoredBlockAtMainChainDepth already consults it before falling
+        // back here, so the consensus path loses no hits.
         logger.trace("[get] Looking in storage for block with hash {}", hash);
         byte[] ba = repository.getStorageBytes(contractAddress, DataWord.valueFromHex(hash.toString()));
         if (ba == null) {
             logger.trace("[get] Block with hash {} not found in storage", hash);
+            // Deliberately NOT cached. A repository read that cannot find a node
+            // and a genuinely absent value both return null, and nothing at this
+            // layer can tell them apart. Recording an absence would let a partial
+            // state turn into a wrong answer for a later consensus-required
+            // lookup. See the class javadoc.
             return null;
         }
-        return byteArrayToStoredBlock(ba);
+
+        StoredBlock block = byteArrayToStoredBlock(ba);
+        if (cacheBlocks != null) {
+            // Populating from a read that happened anyway is the whole of R1.
+            // Safe to share across tracks: the entry is keyed by the block's own
+            // header hash and a StoredBlock's height and chain work are fixed by
+            // its ancestry, so the value cannot be wrong or go stale. Only
+            // *presence* is track-specific, which is why get() does not answer
+            // from here.
+            cacheBlocks.put(hash, block);
+        }
+        return block;
     }
 
     @Override
@@ -146,9 +197,6 @@ public class RepositoryBtcBlockStoreWithCache implements BtcBlockStoreWithCache 
         logger.trace("Set new chain head with height: {}.", newChainHead.getHeight());
         byte[] ba = storedBlockToByteArray(newChainHead);
         repository.addStorageBytes(contractAddress, DataWord.fromString(BLOCK_STORE_CHAIN_HEAD_KEY), ba);
-        if (cacheBlocks != null) {
-            populateCache(newChainHead);
-        }
         setMainChainBlock(newChainHead.getHeight(), newChainHead.getHeader().getHash());
     }
 
@@ -243,28 +291,6 @@ public class RepositoryBtcBlockStoreWithCache implements BtcBlockStoreWithCache 
         return block;
     }
 
-    private synchronized void populateCache(StoredBlock chainHead) {
-        logger.trace("Populating BTC Block Store Cache.");
-        if (this.btcNetworkParams.getGenesisBlock().equals(chainHead.getHeader())) {
-            return;
-        }
-        cacheBlocks.put(chainHead.getHeader().getHash(), chainHead);
-        Sha256Hash blockHash = chainHead.getHeader().getPrevBlockHash();
-        int depth = this.maxDepthBlockCache - 1;
-        while (blockHash != null && depth > 0) {
-            if (cacheBlocks.get(blockHash) != null) {
-                break;
-            }
-            StoredBlock currentBlock = get(blockHash);
-            if (currentBlock == null) {
-                break;
-            }
-            cacheBlocks.put(currentBlock.getHeader().getHash(), currentBlock);
-            depth--;
-            blockHash = currentBlock.getHeader().getPrevBlockHash();
-        }
-        logger.trace("END Populating BTC Block Store Cache.");
-    }
 
     @Override
     @Deprecated
