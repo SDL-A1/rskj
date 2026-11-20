@@ -20,12 +20,15 @@ package co.rsk.trie.segbuild;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ReadOptions;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A whole segbuild chunk held in memory, as byte arenas with an open-addressed index.
@@ -113,12 +116,6 @@ public final class SegbuildResidentChunk {
     /** The largest message the 16 length bits can describe. */
     static final int MAX_MESSAGE_LENGTH = (1 << LENGTH_BITS) - 1;
 
-    /**
-     * Index load factor. 0.75 keeps the {@code long[]} modest -- 134 MB for 10.8M nodes -- while
-     * leaving linear probing short. Lower would cost memory to save probes that are already cheap,
-     * since a probe walks forward into the next cache line.
-     */
-    private static final double LOAD_FACTOR = 0.75;
 
     private final byte[][] arenas;
     private final long[] slots;
@@ -173,22 +170,108 @@ public final class SegbuildResidentChunk {
      *
      * @param expectedEntries a hint used only to size the first pass's reporting; may be 0
      */
+    /**
+     * Loads every node in {@code columnFamily} into memory.
+     *
+     * <h3>One pass, and no allocation per node</h3>
+     *
+     * The obvious implementation costs far more than the data. {@code it.key()}
+     * and {@code it.value()} each allocate a fresh {@code byte[]}, so a
+     * two-pass load -- one to measure, one to fill -- allocates four arrays per
+     * node, and the measuring pass allocates two of them purely to read their
+     * lengths. On a 25.3M-node chunk that is 101 million throwaway arrays:
+     * measured at 92 s for 2,468 MB, or 27 MB/s, which is nowhere near the
+     * disk. The time was garbage collection.
+     *
+     * So this reads with {@code key(byte[], int, int)} and
+     * {@code value(byte[], int, int)}, whose destination is the arena itself.
+     * One copy out of RocksDB, no intermediate object, nothing for the
+     * collector to trace.
+     *
+     * The measuring pass is gone with it. Arenas are appended to as they fill,
+     * so no byte estimate is needed at all, and the index is sized from
+     * {@code rocksdb.estimate-num-keys} and rehashed if that estimate proves
+     * low -- which costs one rehash at worst, against a guaranteed second scan.
+     */
     public static SegbuildResidentChunk load(
             @Nonnull RocksDB db, @Nonnull ColumnFamilyHandle columnFamily, long expectedEntries) {
         long start = System.nanoTime();
 
+        long estimate = expectedEntries;
+        if (estimate <= 0) {
+            try {
+                estimate = db.getLongProperty(columnFamily, "rocksdb.estimate-num-keys");
+            } catch (RocksDBException e) {
+                estimate = 0;
+            }
+        }
+        // Generous: a rehash costs a full re-insert, while slack costs 8 bytes
+        // a slot. The estimate is usually within a few percent.
+        int slotCount = tableSizeFor(Math.max(estimate, 1024) * 4 / 3);
+        long[] slots = new long[slotCount];
+
+        // Size arenas from RocksDB's own estimate of the data, and shrink as the
+        // remainder does. Allocating a full ARENA_BYTES up front costs 1 GiB of
+        // heap for a 1 MB chunk -- the test asserting heap < 2x data catches
+        // exactly that -- and sizing only the first arena leaves the last one a
+        // full gigabyte for its tail.
+        long sizeHint;
+        try {
+            sizeHint = db.getLongProperty(columnFamily, "rocksdb.total-sst-files-size");
+        } catch (RocksDBException e) {
+            sizeHint = 0;
+        }
+        if (sizeHint <= 0) {
+            // A chunk whose data is still in the write-ahead log reports no SST
+            // bytes. Start modestly and grow.
+            sizeHint = 64L << 20;
+        }
+        long remainingHint = sizeHint;
+
+        List<byte[]> arenas = new ArrayList<>();
+        remainingHint -= appendArena(arenas, remainingHint, 0);
+        int arenaIndex = 0;
+        int arenaOffset = 0;
+
         long count = 0;
         long bytes = 0;
         int maxLength = 0;
+
         try (ReadOptions options = readOptions(); RocksIterator it = db.newIterator(columnFamily, options)) {
             for (it.seekToFirst(); it.isValid(); it.next()) {
-                int keyLength = it.key().length;
-                int valueLength = it.value().length;
-                if (keyLength != KEY_LENGTH) {
-                    throw new IllegalStateException(String.format(
-                            "Segbuild node key is %d bytes, expected %d; this store is not a trie "
-                                    + "node store or its layout has changed",
-                            keyLength, KEY_LENGTH));
+                byte[] arena = arenas.get(arenaIndex);
+
+                // There must be somewhere to attempt the read before asking how
+                // long the value is: an exactly-full arena leaves no room, and
+                // standing in for that with a sentinel length is how the size
+                // check below came to see a 2 GB node.
+                if (arena.length - arenaOffset <= KEY_LENGTH) {
+                    remainingHint -= nextArena(arenas, remainingHint, 0);
+                    arenaIndex++;
+                    arena = arenas.get(arenaIndex);
+                    arenaOffset = 0;
+                }
+
+                // Read the value straight into where it will live. The call
+                // returns the value's true length even when it did not fit, so
+                // a short arena is detected without having asked its size.
+                int room = arena.length - arenaOffset - KEY_LENGTH;
+                int valueLength = it.value(arena, arenaOffset + KEY_LENGTH, room);
+                if (valueLength > room) {
+                    // Whatever was written into the old arena's tail is
+                    // abandoned: nothing indexes it. The failed read told us the
+                    // true length, so a rare large value gets an arena that fits
+                    // it without inflating every other arena to suit.
+                    remainingHint -= nextArena(arenas, remainingHint, KEY_LENGTH + valueLength);
+                    arenaIndex++;
+                    arena = arenas.get(arenaIndex);
+                    arenaOffset = 0;
+                    int reread = it.value(arena, KEY_LENGTH, arena.length - KEY_LENGTH);
+                    if (reread != valueLength) {
+                        throw new IllegalStateException(String.format(
+                                "Segbuild node message read as %d bytes then %d; the store "
+                                        + "changed under us", valueLength, reread));
+                    }
                 }
                 if (valueLength > MAX_MESSAGE_LENGTH) {
                     throw new IllegalStateException(String.format(
@@ -196,11 +279,27 @@ public final class SegbuildResidentChunk {
                                     + "describe; widen LENGTH_BITS",
                             valueLength, MAX_MESSAGE_LENGTH));
                 }
-                count++;
+
+                int keyLength = it.key(arena, arenaOffset, KEY_LENGTH);
+                if (keyLength != KEY_LENGTH) {
+                    throw new IllegalStateException(String.format(
+                            "Segbuild node key is %d bytes, expected %d; this store is not a trie "
+                                    + "node store or its layout has changed",
+                            keyLength, KEY_LENGTH));
+                }
+
+                if ((count + 1) * 4 > (long) slots.length * 3) {
+                    slots = rehash(slots, arenas);
+                }
+                insertAt(slots, slots.length - 1, arenas, pack(arenaIndex, arenaOffset, valueLength),
+                        arena, arenaOffset);
+
+                arenaOffset += KEY_LENGTH + valueLength;
                 bytes += KEY_LENGTH + valueLength;
                 if (valueLength > maxLength) {
                     maxLength = valueLength;
                 }
+                count++;
             }
         }
 
@@ -208,99 +307,88 @@ public final class SegbuildResidentChunk {
             throw new IllegalStateException("Segbuild chunk holds " + count + " nodes, too many to index");
         }
 
-        int slotCount = Integer.highestOneBit(Math.max(16, (int) Math.ceil(count / LOAD_FACTOR))) << 1;
-        long[] slots = new long[slotCount];
-        byte[][] arenas = allocateArenas(bytes, KEY_LENGTH + maxLength);
-
-        long filled = 0;
-        int arenaIndex = 0;
-        int arenaOffset = 0;
-        try (ReadOptions options = readOptions(); RocksIterator it = db.newIterator(columnFamily, options)) {
-            for (it.seekToFirst(); it.isValid(); it.next()) {
-                byte[] key = it.key();
-                byte[] value = it.value();
-                int need = KEY_LENGTH + value.length;
-
-                // Never split an entry across arenas: the message must be one contiguous run so a
-                // reader can hand out a single array.
-                if (arenaOffset + need > arenas[arenaIndex].length) {
-                    arenaIndex++;
-                    arenaOffset = 0;
-                    if (arenaIndex >= arenas.length) {
-                        throw new IllegalStateException("Segbuild arenas were undersized; this is a bug");
-                    }
-                }
-
-                System.arraycopy(key, 0, arenas[arenaIndex], arenaOffset, KEY_LENGTH);
-                System.arraycopy(value, 0, arenas[arenaIndex], arenaOffset + KEY_LENGTH, value.length);
-
-                insert(slots, slotCount - 1, arenas, pack(arenaIndex, arenaOffset, value.length), key);
-                arenaOffset += need;
-                filled++;
-            }
+        // Trim the final arena to what was used. The size hint comes from
+        // rocksdb.total-sst-files-size, which counts index and filter blocks as
+        // well as keys and values -- for a 2,468 MB chunk it reports 2,718 MB --
+        // so the tail would otherwise carry a few hundred MB of slack that
+        // counts against how many segments fit in a given heap. One copy of the
+        // last arena costs a fraction of a second against a 45 s load.
+        int last = arenas.size() - 1;
+        if (arenaOffset < arenas.get(last).length) {
+            arenas.set(last, java.util.Arrays.copyOf(arenas.get(last), Math.max(arenaOffset, 1)));
         }
 
-        if (filled != count) {
-            throw new IllegalStateException(String.format(
-                    "Segbuild load counted %d nodes then wrote %d; the store changed under us",
-                    count, filled));
-        }
-
-        SegbuildResidentChunk chunk =
-                new SegbuildResidentChunk(arenas, slots, slotCount - 1, (int) count, bytes);
+        SegbuildResidentChunk chunk = new SegbuildResidentChunk(
+                arenas.toArray(new byte[0][]), slots, slots.length - 1, (int) count, bytes);
         chunk.loadMillis = (System.nanoTime() - start) / 1_000_000L;
         logger.info(
                 "Loaded {} nodes ({} MB of data, {} MB of heap, longest message {} B) in {} ms",
-                count, bytes >> 20, chunk.heapBytes() >> 20, maxLength,
-                (System.nanoTime() - start) / 1_000_000L);
-        if (expectedEntries > 0 && expectedEntries != count) {
-            logger.info("Expected {} entries, found {}", expectedEntries, count);
-        }
+                count, bytes >> 20, chunk.heapBytes() >> 20, maxLength, chunk.loadMillis);
         return chunk;
+    }
+
+    /**
+     * Adds an arena sized to what is left of the estimate, never smaller than
+     * {@code mustFit} and never larger than {@link #ARENA_BYTES} (a Java array
+     * cannot exceed {@code Integer.MAX_VALUE} anyway).
+     *
+     * @return the number of bytes allocated, to subtract from the estimate
+     */
+    /**
+     * Appends an arena, refusing rather than silently exceeding the index's
+     * capacity for arena indices.
+     */
+    private static long nextArena(List<byte[]> arenas, long remainingHint, int mustFit) {
+        if (arenas.size() > ARENA_MASK) {
+            throw new IllegalStateException(
+                    "Segbuild chunk needs more than " + (ARENA_MASK + 1) + " arenas");
+        }
+        return appendArena(arenas, remainingHint, mustFit);
+    }
+
+    private static long appendArena(List<byte[]> arenas, long remainingHint, int mustFit) {
+        long want = Math.max(remainingHint, 0) + 64 * 1024;
+        want = Math.max(want, mustFit);
+        want = Math.max(want, 1L << 20);
+        want = Math.min(want, ARENA_BYTES);
+        if (want < mustFit) {
+            throw new IllegalStateException(
+                    "Segbuild entry of " + mustFit + " bytes does not fit an arena");
+        }
+        arenas.add(new byte[(int) want]);
+        return want;
+    }
+
+    private static int tableSizeFor(long wanted) {
+        long n = 16;
+        while (n < wanted && n < (1L << 30)) {
+            n <<= 1;
+        }
+        return (int) n;
+    }
+
+    /** Doubles the index and re-inserts every entry, reading keys from the arenas. */
+    private static long[] rehash(long[] old, List<byte[]> arenas) {
+        long[] bigger = new long[old.length << 1];
+        int mask = bigger.length - 1;
+        for (long slot : old) {
+            if (slot == 0) {
+                continue;
+            }
+            byte[] arena = arenas.get(arenaOf(slot));
+            int at = bucketOfArena(arena, offsetOf(slot), mask);
+            while (bigger[at] != 0) {
+                at = (at + 1) & mask;
+            }
+            bigger[at] = slot;
+        }
+        return bigger;
     }
 
     private static ReadOptions readOptions() {
         // A full scan should not evict whatever the block cache holds, and it does not benefit
         // from readahead bookkeeping per key.
         return new ReadOptions().setFillCache(false).setVerifyChecksums(false);
-    }
-
-    /**
-     * Arenas sized to the data, with enough slack that no entry straddles a boundary.
-     *
-     * <p>The slack is the largest entry actually present, not the largest the index could
-     * describe. Using the theoretical maximum would floor every arena at 16 MB and make a 1 MB
-     * chunk cost sixteen times its size.
-     */
-    private static byte[][] allocateArenas(long bytes, int maxEntry) {
-        // Everything in one arena cannot straddle anything, so size it exactly.
-        if (bytes <= ARENA_BYTES) {
-            return new byte[][] {new byte[(int) Math.max(bytes, maxEntry)]};
-        }
-
-        // Each arena may waste up to one entry's worth at its tail, so divide by the usable span.
-        int usable = ARENA_BYTES - maxEntry;
-        if (usable <= 0) {
-            throw new IllegalStateException(
-                    "Segbuild entry of " + maxEntry + " bytes does not fit an arena");
-        }
-        int arenaCount = (int) ((bytes + usable - 1) / usable);
-        if (arenaCount > ARENA_MASK + 1) {
-            throw new IllegalStateException(
-                    "Segbuild chunk needs " + arenaCount + " arenas, over the " + (ARENA_MASK + 1)
-                            + " the index can describe");
-        }
-        byte[][] arenas = new byte[arenaCount][];
-        for (int i = 0; i < arenaCount - 1; i++) {
-            arenas[i] = new byte[ARENA_BYTES];
-        }
-        // Size the last arena to what is left rather than giving it a full gigabyte. A chunk
-        // holding just over 1 GiB otherwise gets two full arenas -- 2 GiB of heap for 1.05 GiB of
-        // data -- and the pre-fork chunks sit exactly on that boundary.
-        long placed = (long) (arenaCount - 1) * usable;
-        long tail = Math.max(bytes - placed, 0) + maxEntry;
-        arenas[arenaCount - 1] = new byte[(int) Math.min(tail, ARENA_BYTES)];
-        return arenas;
     }
 
     private static long pack(int arenaIndex, int offset, int length) {
@@ -335,6 +423,47 @@ public final class SegbuildResidentChunk {
         return (int) (h ^ (h >>> 32)) & mask;
     }
 
+    /** The bucket for a key that is already sitting in an arena. */
+    private static int bucketOfArena(byte[] arena, int offset, int mask) {
+        long h = ((long) (arena[offset] & 0xff) << 56)
+                | ((long) (arena[offset + 1] & 0xff) << 48)
+                | ((long) (arena[offset + 2] & 0xff) << 40)
+                | ((long) (arena[offset + 3] & 0xff) << 32)
+                | ((long) (arena[offset + 4] & 0xff) << 24)
+                | ((long) (arena[offset + 5] & 0xff) << 16)
+                | ((long) (arena[offset + 6] & 0xff) << 8)
+                | (arena[offset + 7] & 0xff);
+        return (int) (h ^ (h >>> 32)) & mask;
+    }
+
+    /**
+     * Inserts an entry whose key is already written into {@code arena} at
+     * {@code offset}, so the key never exists as a separate object.
+     */
+    private static void insertAt(long[] slots, int mask, List<byte[]> arenas, long packed,
+                                 byte[] arena, int offset) {
+        int at = bucketOfArena(arena, offset, mask);
+        while (slots[at] != 0) {
+            // Content-addressed, so a repeated key carries a repeated message.
+            if (keyMatchesArena(arenas, slots[at], arena, offset)) {
+                return;
+            }
+            at = (at + 1) & mask;
+        }
+        slots[at] = packed;
+    }
+
+    private static boolean keyMatchesArena(List<byte[]> arenas, long slot, byte[] other, int otherOffset) {
+        byte[] arena = arenas.get(arenaOf(slot));
+        int at = offsetOf(slot);
+        for (int i = 0; i < KEY_LENGTH; i++) {
+            if (arena[at + i] != other[otherOffset + i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static boolean keyMatches(byte[][] arenas, long slot, byte[] key) {
         byte[] arena = arenas[arenaOf(slot)];
         int at = offsetOf(slot);
@@ -346,18 +475,6 @@ public final class SegbuildResidentChunk {
         return true;
     }
 
-    private static void insert(long[] slots, int mask, byte[][] arenas, long packed, byte[] key) {
-        int at = bucketOf(key, mask);
-        while (slots[at] != 0) {
-            // Content-addressed, so an identical key carries an identical message; RocksDB will
-            // not hand out the same key twice anyway, but tolerating it costs nothing.
-            if (keyMatches(arenas, slots[at], key)) {
-                return;
-            }
-            at = (at + 1) & mask;
-        }
-        slots[at] = packed;
-    }
 
     /**
      * The message for {@code key}, or null if this chunk does not hold it.
