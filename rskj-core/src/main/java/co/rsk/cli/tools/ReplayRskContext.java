@@ -75,6 +75,9 @@ public class ReplayRskContext extends RskContext {
     /** Serve segbuild misses from the node's own unitrie, counting them, instead of failing. */
     private final boolean segbuildFallback;
 
+    /** Hold each segbuild chunk in heap rather than reading it from RocksDB. */
+    private final boolean segbuildResident;
+
     @Nullable
     private SegbuildTrieStore segbuildTrieStore;
 
@@ -84,11 +87,17 @@ public class ReplayRskContext extends RskContext {
 
     public ReplayRskContext(String[] args, TrieBackend trieBackend, @Nullable Path segbuildRoot,
                             boolean allowWrites, boolean segbuildFallback) {
+        this(args, trieBackend, segbuildRoot, allowWrites, segbuildFallback, false);
+    }
+
+    public ReplayRskContext(String[] args, TrieBackend trieBackend, @Nullable Path segbuildRoot,
+                            boolean allowWrites, boolean segbuildFallback, boolean segbuildResident) {
         super(args);
         this.trieBackend = trieBackend;
         this.segbuildRoot = segbuildRoot;
         this.allowWrites = allowWrites;
         this.segbuildFallback = segbuildFallback;
+        this.segbuildResident = segbuildResident;
     }
 
     public boolean isAllowWrites() {
@@ -119,9 +128,10 @@ public class ReplayRskContext extends RskContext {
                 throw new IllegalStateException("A segbuild root directory is required for the segbuild backend");
             }
             TrieStore fallback = segbuildFallback ? buildUnitrieStore(trieStorePath) : null;
-            // Same node-cache budget the unitrie backend gets, so the two are comparable.
+            // Same node-cache budget the unitrie backend gets, so the two are comparable. Ignored
+            // in resident mode, where a cache in front of a resident chunk only duplicates it.
             segbuildTrieStore = new SegbuildTrieStore(SegbuildChunkIndex.scan(segbuildRoot), fallback,
-                    getRskSystemProperties().getStatesCacheSize());
+                    getRskSystemProperties().getStatesCacheSize(), segbuildResident);
             return segbuildTrieStore;
         }
 

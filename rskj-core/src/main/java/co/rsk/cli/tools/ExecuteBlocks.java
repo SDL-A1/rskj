@@ -75,6 +75,15 @@ public class ExecuteBlocks extends PicoCliToolRskContextAware {
             description = "Root directory of the segbuild chunk set. Required for --trieStore=SEGBUILD.")
     private String segbuildDir;
 
+    @CommandLine.Option(names = {"-sr", "--segbuildResident"}, defaultValue = "false",
+            description = "Load each segbuild chunk wholly into memory as it is opened and close "
+                    + "the database (default: ${DEFAULT-VALUE}). A trie walk is a chain of "
+                    + "dependent reads, so throughput is bound by per-read latency rather than by "
+                    + "bytes or CPU; holding the chunk in heap removes RocksDB from the read path "
+                    + "instead of merely caching in front of it. Costs about the chunk's own size "
+                    + "in heap, so size -Xmx accordingly.")
+    private boolean segbuildResident;
+
     @CommandLine.Option(names = {"-sf", "--segbuildFallback"}, defaultValue = "false",
             description = "When a segbuild chunk does not hold a node, read it from the node's own "
                     + "unitrie and count it, instead of failing (default: ${DEFAULT-VALUE}). A chunk holds "
@@ -107,7 +116,8 @@ public class ExecuteBlocks extends PicoCliToolRskContextAware {
     @Override
     public void execute(String[] args, NodeStopper nodeStopper) {
         preParseOptions(args);
-        execute(args, () -> new ReplayRskContext(args, trieBackend, segbuildRoot(), allowWrites, segbuildFallback),
+        execute(args, () -> new ReplayRskContext(args, trieBackend, segbuildRoot(), allowWrites,
+                        segbuildFallback, segbuildResident),
                 nodeStopper);
     }
 
@@ -223,6 +233,10 @@ public class ExecuteBlocks extends PicoCliToolRskContextAware {
                     executed, fromBlockNumber, toBlockNumber);
             if (segbuildStore != null) {
                 printInfo("Segbuild chunks opened: {}", segbuildStore.getChunkOpenCount());
+                if (segbuildStore.isResident()) {
+                    printInfo("Segbuild resident load: {} ms (setup, not execution)",
+                            segbuildStore.getResidentLoadMillis());
+                }
                 printInfo("Segbuild node reads: {} ({} served from the node cache)",
                         segbuildStore.getReadCount(), segbuildStore.getCacheHitCount());
                 if (segbuildStore.hasFallback()) {

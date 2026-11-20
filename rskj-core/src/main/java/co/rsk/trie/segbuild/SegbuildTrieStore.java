@@ -122,6 +122,24 @@ public class SegbuildTrieStore implements TrieStore {
      * not match rather than as the storage failure it is. Recording it lets the caller say what
      * actually went wrong.
      */
+    /**
+     * The whole chunk in memory, when residency was asked for.
+     *
+     * <p>This replaces the RocksDB handle rather than sitting in front of it: once loaded the
+     * database is closed, which is the point. A trie walk is a chain of dependent reads, so what
+     * costs time is per-read latency, and an LRU in front of RocksDB still pays a JNI crossing, an
+     * index search and a block decode on every miss. With the chunk resident there are no misses
+     * and no RocksDB at all. Keeping the database open as well would hold its block cache for
+     * nothing.
+     */
+    @Nullable
+    private SegbuildResidentChunk resident;
+
+    /** Whether to load each chunk into memory as it is opened. */
+    private final boolean residentMode;
+
+    private long residentLoadMillis;
+
     @Nullable
     private SegbuildMissingNodeException lastMiss;
 
@@ -161,9 +179,48 @@ public class SegbuildTrieStore implements TrieStore {
      * @param cacheSize how many node messages to keep in memory, or 0 for no cache
      */
     public SegbuildTrieStore(@Nonnull SegbuildChunkIndex index, @Nullable TrieStore fallback, int cacheSize) {
+        this(index, fallback, cacheSize, false);
+    }
+
+    /**
+     * @param cacheSize how many node messages to keep in memory, or 0 for no cache. Ignored when
+     *                  {@code resident} is set, since a resident chunk never misses.
+     * @param resident  load each chunk wholly into memory as it is opened, and close the database.
+     *                  Costs roughly the chunk's size in heap and removes RocksDB from the read
+     *                  path entirely.
+     */
+    public SegbuildTrieStore(
+            @Nonnull SegbuildChunkIndex index,
+            @Nullable TrieStore fallback,
+            int cacheSize,
+            boolean resident) {
         this.index = index;
         this.fallback = fallback;
-        this.nodeCache = cacheSize > 0 ? newLruCache(cacheSize) : null;
+        this.residentMode = resident;
+        // A cache in front of a resident chunk would only duplicate it.
+        this.nodeCache = (!resident && cacheSize > 0) ? newLruCache(cacheSize) : null;
+    }
+
+    /** Whether chunks are being held in memory. */
+    public boolean isResident() {
+        return residentMode;
+    }
+
+    /**
+     * Total time spent loading resident chunks, across every chunk opened.
+     *
+     * <p>Reported separately because it is setup, not execution. A 2.7 GB chunk
+     * takes tens of seconds to load, so a run short enough to fit one chunk
+     * reports mostly loader throughput if the two are added together.
+     */
+    public long getResidentLoadMillis() {
+        return residentLoadMillis;
+    }
+
+    /** The resident chunk currently loaded, for reporting its size. */
+    @Nullable
+    public SegbuildResidentChunk getResidentChunk() {
+        return resident;
     }
 
     private static Map<ByteArrayWrapper, byte[]> newLruCache(int maxEntries) {
@@ -256,6 +313,18 @@ public class SegbuildTrieStore implements TrieStore {
             this.chunkOpenCount++;
 
             logger.debug("Opened segbuild {} read-only at {}", chunk, sealed);
+
+            if (residentMode) {
+                logger.info("Loading segbuild {} into memory", chunk);
+                SegbuildResidentChunk loaded =
+                        SegbuildResidentChunk.load(opened, this.trieNodes, 0);
+                // Close the database now the data is in heap. Holding it open would keep its
+                // block cache, its index and filter blocks and its file handles for a store
+                // nothing will read again.
+                this.resident = loaded;
+                this.residentLoadMillis += loaded.loadMillis();
+                closeDatabaseOnly();
+            }
         } catch (RocksDBException e) {
             options.close();
             for (ColumnFamilyHandle handle : handles) {
@@ -271,6 +340,16 @@ public class SegbuildTrieStore implements TrieStore {
     }
 
     private void closeCurrentChunk() {
+        closeDatabaseOnly();
+        // Drop the arenas with the chunk. Node hashes are content-addressed so the entries would
+        // stay valid, but a chunk switch means the working set has moved on, and a gigabyte of
+        // stale arena is the most expensive thing on the heap.
+        resident = null;
+        openChunk = null;
+    }
+
+    /** Releases the RocksDB handles, leaving any resident copy in place. */
+    private void closeDatabaseOnly() {
         if (db != null) {
             db.close();
             db = null;
@@ -284,7 +363,6 @@ public class SegbuildTrieStore implements TrieStore {
             openOptions = null;
         }
         trieNodes = null;
-        openChunk = null;
     }
 
     /** Every read asked of this store, whether the chunk served it or the cache did. */
@@ -295,6 +373,13 @@ public class SegbuildTrieStore implements TrieStore {
     @Nullable
     private byte[] get(byte[] key) {
         readCount++;
+
+        // Resident chunks answer from heap and have no database behind them, so this comes first
+        // and the positioning check below is phrased for both cases.
+        if (resident != null) {
+            return resident.get(key);
+        }
+
         if (db == null || trieNodes == null) {
             throw new IllegalStateException(
                     "Segbuild store is not positioned on a chunk; call positionAt(blockNumber) first");
