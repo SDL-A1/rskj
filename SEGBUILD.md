@@ -75,18 +75,54 @@ A worker holds one segment resident. Measured per-worker footprint for rskj is
 for those measurements. The current set's largest segment is bigger again
 (`094`, 4.3 GB on disk), so budget nearer **~5 GB** for the peak.
 
-| RAM | workers that *fit* (median / peak segment) | workers that *help* on 4 cores | whole chain, rskj |
-|---|---|---|---|
-| 8 GB | 3 / 1 | 3 | **~16–17 h** |
-| 16 GB | 7 / 3 | 3 | ~16–17 h — unchanged |
-| 32 GB | 15 / 6 | 3 | ~16–17 h — unchanged |
+| Machine | cores | RAM | workers that *fit* | workers that *help* | whole chain, rskj |
+|---|---|---|---|---|---|
+| this test box (x86) | 4 | 8 GB | 3 / 1 at peak | 3 | **~16–17 h** *(measured basis)* |
+| same box, more RAM | 4 | 16 GB | 7 / 3 | 3 | ~16–17 h — **unchanged** |
+| same box, more RAM | 4 | 32 GB | 15 / 6 | 3 | ~16–17 h — **unchanged** |
+| **MacBook Pro M4 Max** | **14–16** | **36 GB** | 17 / 6 | ~8–10 | **~4–8 h** *(projection)* |
 
-The 8 GB row is the only one grounded in measurement: 3 workers at ~16 h for
-replay, ~17 h including segment loading. The others are arithmetic on the
-per-worker footprint, and they say something more useful than a time — that
-**more RAM alone buys nothing**. On a 4-core box the ceiling is 3 workers
-whatever the memory, and that ceiling was measured rather than assumed: a
-fourth worker contributed about **4% of throughput for 25% of the memory**.
+Only the first row has measurement behind it: 3 workers at ~16 h replay, ~17 h
+including segment loading. The 16 and 32 GB rows are arithmetic on the measured
+per-worker footprint, and they are here because the answer is counter-intuitive
+— **more RAM alone buys nothing**. On four cores the ceiling is three workers
+whatever the memory, and that was measured rather than assumed: a fourth worker
+contributed about **4% of throughput for 25% of the memory**.
+
+### The M4 Max row, and how much to trust it
+
+It is the machine most rskj developers actually have, so it is worth
+estimating — but **nothing here has been measured on Apple Silicon**, and the
+band is wide for two honest reasons.
+
+The M4 Max has 14 or 16 CPU cores (10–12 performance plus 4 efficiency) and
+36 GB of unified memory. At ~2.0 GB per worker on a median segment, memory
+stops being the limit: 8–10 workers fit comfortably with headroom for one peak
+segment. So unlike the 16 and 32 GB rows above, the extra RAM *is* usable
+here, because the cores exist to use it.
+
+Two things pull the estimate in opposite directions, and neither is measured:
+
+- **Per-core speed is higher.** JVM throughput on an M4 performance core should
+  beat this box's x86 cores, plausibly by 1.5–2x.
+- **Scaling stays sub-linear.** Two workers measured **1.81x** and **1.62x**,
+  not 2x, because memory bandwidth and page cache are shared. Eight workers
+  will not be 8x. Unified memory is fast, but it is one pool, shared with the
+  GPU.
+
+Combining a sub-linear 8-worker speedup with a faster core gives roughly
+**4–8 hours**. Treat the lower end as optimistic. If you run it, the measured
+number is worth more than this paragraph.
+
+**Disk matters more than you would expect on a laptop.** The archive is ~148 GB
+and extracts to ~148 GB, so a straight `tar -xf` wants **~300 GB free** before
+the tarball can be deleted. On a 512 GB machine that is most of the free space.
+Extract onto an external SSD if you have one — throughput there is not the
+bottleneck, since the work is CPU-bound once a chunk is resident.
+
+**Use an ARM-native JDK 17** (Temurin or Zulu for `aarch64`). A Rosetta-
+translated x86 JDK will run and will be substantially slower, which would make
+any timing taken on it misleading.
 
 Measured two-worker speedup is **1.81x** (pre-fork blocks) and **1.62x**
 (Unitrie era) — not 2x, because memory bandwidth and page cache are shared. The
